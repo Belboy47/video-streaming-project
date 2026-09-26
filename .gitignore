@@ -35,3 +35,6 @@ Thumbs.db
 # Video files
 files/*.mp4
 files/**/*.mp4
+frontend/public/1/
+frontend/public/2/
+segments/

@@ -1,13 +1,14 @@
 #include <WinSock2.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <ws2tcpip.h>
 
 bool sendAll(SOCKET &clientSocket, std::string &response);
-bool sendAll(SOCKET &clientSocket, char *videoBuffer, int bytesRead);
+bool sendAll(SOCKET &clientSocket, char *buffer, int bytesRead);
 std::string normalHeader(std::string contentType, std::string contentLength);
-std::string paritialHeader(std::string contentType, std::string contentLength, std::string start, std::string end);
+std::string getFileSize(std::string filePath);
 
 int main() {
   //--------------------------------------------SOCKET
@@ -44,72 +45,64 @@ int main() {
       std::string method = receivedMessage.substr(0, firstSpace);
       std::string path = receivedMessage.substr(firstSpace + 1, (secondSpace - firstSpace) - 1);
       std::string version = receivedMessage.substr(secondSpace + 1, (lineEnd - secondSpace) - 1);
-      size_t range = receivedMessage.find("Range: bytes=");
       std::cout << receivedMessage << "\n";
 
-      std::string rangeStarting;
-      std::string rangeEnding;
-      if (range == std::string::npos) {
+      size_t firstSlashPos;
+      size_t secondSlashPos;
+      size_t thirdSlashPos;
+      std::string resourceType;
+      std::string quality;
+      std::string fileName;
+
+      if (path.find("manifest.mpd") != std::string::npos) {
+        firstSlashPos = path.find('/');
+        secondSlashPos = path.find('/', firstSlashPos + 1);
+        resourceType = path.substr(firstSlashPos + 1, secondSlashPos - firstSlashPos - 1);
+        fileName = path.substr(secondSlashPos + 1);
+      } else {
+        firstSlashPos = path.find('/');
+        secondSlashPos = path.find('/', firstSlashPos + 1);
+        thirdSlashPos = path.find('/', secondSlashPos + 1);
+        resourceType = path.substr(firstSlashPos + 1, secondSlashPos - firstSlashPos - 1);
+        quality = path.substr(secondSlashPos + 1, thirdSlashPos - secondSlashPos - 1);
+        fileName = path.substr(thirdSlashPos + 1);
+      }
+      std::cout << resourceType << '\n';
+      std::cout << quality << '\n';
+      std::cout << fileName << '\n';
+      std::string filePath = path.substr(1);
+
+      if (resourceType.empty() || fileName.empty() || resourceType != "segments" ||
+          !quality.empty() && quality != "480" && quality != "720" && quality != "1080") {
         closesocket(clientSocket);
         continue;
       }
-      // Finding Range
-      size_t rangeStartingPos = receivedMessage.find("Range: bytes=");
-      rangeStartingPos += std::string("Range: bytes=").length();
-      size_t rangeDashPos = receivedMessage.find('-', rangeStartingPos);
-      rangeStarting = receivedMessage.substr(rangeStartingPos, rangeDashPos - rangeStartingPos);
-      size_t rangeEndingPos = rangeDashPos + 1;
-      size_t endingR = receivedMessage.find("\r", rangeEndingPos);
-      rangeEnding = receivedMessage.substr(rangeEndingPos, endingR - rangeEndingPos);
+      std::string fileType;
+      if (fileName.ends_with(".mpd"))
+        fileType = "application/dash+xml";
+      else if (fileName.ends_with(".mp4"))
+        fileType = "video/mp4";
+      else if (fileName.ends_with(".m4s"))
+        fileType = "video/iso.segment";
 
-      std::string filepath;
-      if (path == "/video/480")
-        filepath = "files/video_480.mp4";
-
-      else if (path == "/video/720")
-        filepath = "files/video_720.mp4";
-
-      else if (path == "/video/1080")
-        filepath = "files/video_1080.mp4";
-
-      else {
-        std::cout << "Wrong path chosen.";
-        return -1;
+      std::ifstream file(filePath, std::ios::binary);
+      if (!file) {
+        std::cout << "File DOES NOT EXIST";
+        closesocket(clientSocket);
+        continue;
       }
-
-      std::ifstream video(filepath, std::ios::binary);
-      if (!video) {
-        std::cout << "opening the video was not successful";
-        return -1;
-      }
-      video.seekg(0, std::ios::end);
-      auto filesize = video.tellg();
-      video.seekg(0, std::ios::beg);
-
-      std::string contentLength = std::to_string(filesize);
-      std::string header = paritialHeader("video/mp4", contentLength, rangeStarting, rangeEnding);
-      std::cout << header;
+      std::string header = normalHeader(fileType, getFileSize(filePath));
       sendAll(clientSocket, header);
 
-      video.seekg(std::stoll(rangeStarting), std::ios::beg);
-      char videoBuffer[4096];
-      int howMuchToRead;
-      if (!rangeEnding.empty())
-        howMuchToRead = std::stoll(rangeEnding) - (std::stoll(rangeStarting) - 1);
-      else
-        howMuchToRead = std::stoll(contentLength) - std::stoll(rangeStarting);
-      while (howMuchToRead) {
-        if (howMuchToRead >= sizeof(videoBuffer))
-          video.read(videoBuffer, sizeof(videoBuffer));
-        else if (howMuchToRead < sizeof(videoBuffer))
-          video.read(videoBuffer, howMuchToRead);
+      char buffer[4096];
+      while (file) {
+        file.read(buffer, sizeof(buffer));
 
-        auto bytesRead = video.gcount();
-        if (bytesRead <= 0)
-          break;
+        auto bytesRead = file.gcount();
 
-        sendAll(clientSocket, videoBuffer, static_cast<int>(bytesRead));
-        howMuchToRead -= bytesRead;
+        if (bytesRead > 0) {
+          sendAll(clientSocket, buffer, static_cast<int>(bytesRead));
+        }
       }
     }
     closesocket(clientSocket);
@@ -128,10 +121,10 @@ bool sendAll(SOCKET &clientSocket, std::string &response) {
   return true;
 }
 
-bool sendAll(SOCKET &clientSocket, char *videoBuffer, int bytesRead) {
+bool sendAll(SOCKET &clientSocket, char *buffer, int bytesRead) {
   int totalSent{};
   while (totalSent < bytesRead) {
-    int temp = send(clientSocket, videoBuffer + totalSent, bytesRead - totalSent, 0);
+    int temp = send(clientSocket, buffer + totalSent, bytesRead - totalSent, 0);
     if (temp == SOCKET_ERROR)
       return false;
 
@@ -150,38 +143,13 @@ std::string normalHeader(std::string contentType, std::string contentLength) {
          "Content-Type: " +
          contentType +
          "\r\n"
+         "Access-Control-Allow-Origin: *\r\n"
+         "Connection: close\r\n"
          "\r\n";
 }
 
-std::string paritialHeader(std::string contentType, std::string contentLength, std::string start, std::string end) {
-  if (end.empty()) {
-    return "HTTP/1.1 206 Partial Content \r\n"
-           "Content-Length: " +
-           std::to_string(std::stoll(contentLength) - (std::stoll(start))) +
-           "\r\n"
-           "Content-Type: " +
-           contentType +
-           "\r\n"
-           "Accept-Ranges: bytes\r\n"
-           "Content-Range: bytes " +
-           start + "-" + std::to_string(std::stoll(contentLength) - 1) + "/" + contentLength +
-           "\r\n"
-           "Connection: close \r\n"
-           "\r\n";
-  } else if (!end.empty()) {
-    return "HTTP/1.1 206 Partial Content \r\n"
-           "Content-Length: " +
-           std::to_string(std::stoll(end) - std::stoll(start) + 1) +
-           "\r\n"
-           "Content-Type: " +
-           contentType +
-           "\r\n"
-           "Accept-Ranges: bytes\r\n"
-           "Content-Range: bytes " +
-           start + "-" + end + "/" + contentLength +
-           "\r\n"
-           "Connection: close \r\n"
-           "\r\n";
-  }
-  return "";
+std::string getFileSize(std::string filePath) {
+  auto fileSize = std::filesystem::file_size(filePath);
+  std::string fileSizeSTR = std::to_string(fileSize);
+  return fileSizeSTR;
 }

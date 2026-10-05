@@ -1,37 +1,73 @@
-#include <WinSock2.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+//----------------------
+#ifdef _WIN32
+
+#include <WinSock2.h>
 #include <ws2tcpip.h>
 
-bool sendAll(SOCKET &clientSocket, std::string &response);
-bool sendAll(SOCKET &clientSocket, char *buffer, int bytesRead);
+using Socket = SOCKET;
+
+void closeSocket(Socket s) { closesocket(s); }
+
+constexpr int SEND_FLAGS = 0;
+#else
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+using Socket = int;
+
+void closeSocket(Socket s) { close(s); }
+
+constexpr int INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+
+constexpr int SEND_FLAGS = MSG_NOSIGNAL;
+#endif
+//-------------------
+
+//----------------------
+
+bool sendAll(Socket &clientSocket, std::string &response);
+bool sendAll(Socket &clientSocket, char *buffer, int bytesRead);
 std::string normalHeader(std::string contentType, std::string contentLength);
 std::string getFileSize(std::string filePath);
 
 int main() {
-  //--------------------------------------------SOCKET
+//--------------------------------------------SOCKET
+#ifdef _WIN32
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
     std::cout << "WSA Startup Failed";
     return -1;
   }
-  SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+#endif
+  Socket serverSocket = socket(AF_INET, SOCK_STREAM, 0);
   if (serverSocket == INVALID_SOCKET) {
     std::cout << "Failed to create socket.";
     return -1;
   }
   sockaddr_in ServerAddress{};
+#ifdef _WIN32
   ServerAddress.sin_addr.S_un.S_addr = INADDR_ANY;
+
+#else
+  ServerAddress.sin_addr.s_addr = INADDR_ANY;
+#endif
   ServerAddress.sin_port = htons(8080);
   ServerAddress.sin_family = AF_INET;
   bind(serverSocket, (const sockaddr *)&ServerAddress, sizeof(ServerAddress));
   listen(serverSocket, SOMAXCONN);
   sockaddr_in clientAddress{};
-  int sizeOfClientAddress = sizeof(clientAddress);
+  socklen_t sizeOfClientAddress = sizeof(clientAddress);
   while (true) {
-    SOCKET clientSocket = accept(serverSocket, (sockaddr *)&clientAddress, &sizeOfClientAddress);
+    Socket clientSocket = accept(serverSocket, (sockaddr *)&clientAddress, &sizeOfClientAddress);
     std::cout << "Request Received\n";
     //-------------------------------------------------RECEIVING
     char buffer[1024];
@@ -51,30 +87,19 @@ int main() {
       size_t secondSlashPos;
       size_t thirdSlashPos;
       std::string resourceType;
-      std::string quality;
       std::string fileName;
 
-      if (path.find("manifest.mpd") != std::string::npos) {
-        firstSlashPos = path.find('/');
-        secondSlashPos = path.find('/', firstSlashPos + 1);
-        resourceType = path.substr(firstSlashPos + 1, secondSlashPos - firstSlashPos - 1);
-        fileName = path.substr(secondSlashPos + 1);
-      } else {
-        firstSlashPos = path.find('/');
-        secondSlashPos = path.find('/', firstSlashPos + 1);
-        thirdSlashPos = path.find('/', secondSlashPos + 1);
-        resourceType = path.substr(firstSlashPos + 1, secondSlashPos - firstSlashPos - 1);
-        quality = path.substr(secondSlashPos + 1, thirdSlashPos - secondSlashPos - 1);
-        fileName = path.substr(thirdSlashPos + 1);
-      }
+      firstSlashPos = path.find('/');
+      secondSlashPos = path.find('/', firstSlashPos + 1);
+      resourceType = path.substr(firstSlashPos + 1, secondSlashPos - firstSlashPos - 1);
+      fileName = path.substr(secondSlashPos + 1);
+
       std::cout << resourceType << '\n';
-      std::cout << quality << '\n';
       std::cout << fileName << '\n';
       std::string filePath = path.substr(1);
 
-      if (resourceType.empty() || fileName.empty() || resourceType != "segments" ||
-          !quality.empty() && quality != "480" && quality != "720" && quality != "1080") {
-        closesocket(clientSocket);
+      if (resourceType.empty() || fileName.empty() || resourceType != "segments") {
+        closeSocket(clientSocket);
         continue;
       }
       std::string fileType;
@@ -88,7 +113,7 @@ int main() {
       std::ifstream file(filePath, std::ios::binary);
       if (!file) {
         std::cout << "File DOES NOT EXIST";
-        closesocket(clientSocket);
+        closeSocket(clientSocket);
         continue;
       }
       std::string header = normalHeader(fileType, getFileSize(filePath));
@@ -105,14 +130,14 @@ int main() {
         }
       }
     }
-    closesocket(clientSocket);
+    closeSocket(clientSocket);
   }
 }
 
-bool sendAll(SOCKET &clientSocket, std::string &response) {
+bool sendAll(Socket &clientSocket, std::string &response) {
   int totalSent{};
   while (totalSent < response.size()) {
-    int sent = send(clientSocket, response.c_str() + totalSent, response.size() - totalSent, 0);
+    int sent = send(clientSocket, response.c_str() + totalSent, response.size() - totalSent, SEND_FLAGS);
     if (sent == SOCKET_ERROR) {
       return false;
     }
@@ -121,10 +146,10 @@ bool sendAll(SOCKET &clientSocket, std::string &response) {
   return true;
 }
 
-bool sendAll(SOCKET &clientSocket, char *buffer, int bytesRead) {
+bool sendAll(Socket &clientSocket, char *buffer, int bytesRead) {
   int totalSent{};
   while (totalSent < bytesRead) {
-    int temp = send(clientSocket, buffer + totalSent, bytesRead - totalSent, 0);
+    int temp = send(clientSocket, buffer + totalSent, bytesRead - totalSent, SEND_FLAGS);
     if (temp == SOCKET_ERROR)
       return false;
 

@@ -6,12 +6,16 @@ function App() {
   const API_BASE = import.meta.env.DEV ? `http://${window.location.hostname}:8080` : "";
 
   // TODO: Refactor related refs into playerRef / qoeRef / measurementRef
+  const [qualityText, setQualityText] = useState(720);
+  const [manualQuality, setManualQuality] = useState(1);
+  const [manifestData, setManifestData] = useState(null);
+
   const qualityNumberRef = useRef(1);
   const savedTime = useRef(0);
   const wasPaused = useRef(true);
   const videoRef = useRef(null);
   const sourceBufferRef = useRef(null);
-  const nextSegmentRef = useRef(2);
+  const nextSegmentRef = useRef(1);
   const segmentTimelineRef = useRef([]);
   const isSeekingRef = useRef(false);
   const isBufferingRef = useRef(false);
@@ -21,10 +25,6 @@ function App() {
   const qualityIdRef = useRef(1);
   const mediaSourceRef = useRef(null);
   const hasPlaybackStartedRef = useRef(false);
-
-  const [qualityText, setQualityText] = useState(720);
-  const [manualQuality, setManualQuality] = useState(1);
-  const [manifestData, setManifestData] = useState(null);
   //-----------------------------------
   const isCountingStallRef = useRef(false);
   const stallTimerStartRef = useRef(0);
@@ -34,21 +34,22 @@ function App() {
   const startupDelayEndRef = useRef(0);
   const startupDelayRef = useRef(0);
 
-  const swtichDirRef = useRef([]);
-
   const qualityStartTimeRef = useRef(0);
   const qualityEndTimeRef = useRef(0);
   const partialQualityTimeRef = useRef(0);
   const qualityIntervalActiveRef = useRef(false);
 
+  const isQOEReportDoneRef = useRef(false);
+
   const qualityOfExprienceRef = useRef({
-    playbackDuration480: 0,
-    playbackDuration720: 0,
-    playbackDuration1080: 0,
-    stallCount: 0,
+    playbackDurationTotal480: 0,
+    playbackDurationTotal720: 0,
+    playbackDurationTotal1080: 0,
+    stallCountTotal: 0,
     stallDurationTotal: 0,
     qualitySwitchCount: 0,
     abortedDownloadCount: 0,
+    qualitySwitchHistoryArr: [],
   });
   //-------------
   const segmentInfoArrayRef = useRef([]);
@@ -59,6 +60,8 @@ function App() {
   const isInternalQualityChangeRef = useRef(false);
 
   const manifestBandwidthArrRef = useRef([]);
+
+  const isRetryingDownloadRef = useRef(false);
 
   useEffect(() => {
     startupDelayStartRef.current = performance.now();
@@ -110,6 +113,7 @@ function App() {
     videoRef.current.src = url;
     mediaSource.addEventListener("sourceopen", async () => {
       if (mediaSource !== mediaSourceRef.current) return;
+
       //---------------------------------------------
       const sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.64001e"');
       segmentTimelineRef.current = manifestData.timeLine;
@@ -162,46 +166,48 @@ function App() {
       console.log("INIT APPEND");
     }
   }
-  async function setPlaybackQuality(qualityNumber) {
+  async function setPlaybackQuality(qualityNumber, reason) {
     if (qualityNumberRef.current === 0) {
-      qualityOfExprienceRef.current.playbackDuration480 +=
+      qualityOfExprienceRef.current.playbackDurationTotal480 +=
         partialQualityTimeRef.current +
         (videoRef.current.currentTime - qualityStartTimeRef.current);
     } else if (qualityNumberRef.current === 1) {
-      qualityOfExprienceRef.current.playbackDuration720 +=
+      qualityOfExprienceRef.current.playbackDurationTotal720 +=
         partialQualityTimeRef.current +
         (videoRef.current.currentTime - qualityStartTimeRef.current);
     } else {
-      qualityOfExprienceRef.current.playbackDuration1080 +=
+      qualityOfExprienceRef.current.playbackDurationTotal1080 +=
         partialQualityTimeRef.current +
         (videoRef.current.currentTime - qualityStartTimeRef.current);
     }
     partialQualityTimeRef.current = 0;
     qualityStartTimeRef.current = videoRef.current.currentTime;
 
-    if (qualityNumber > qualityNumberRef.current) swtichDirRef.current.push("upgrade");
-    else swtichDirRef.current.push("downgrade");
+    const qualitySwitchHistory = {
+      from: qualityNumberRef.current,
+      to: qualityNumber,
+      videoTime: videoRef.current.currentTime,
+      reason: reason,
+    };
+
+    qualityOfExprienceRef.current.qualitySwitchHistoryArr.push(qualitySwitchHistory);
 
     qualityOfExprienceRef.current.qualitySwitchCount++;
     if (!isInternalQualityChangeRef.current) qualityIdRef.current++;
     isInternalQualityChangeRef.current = false;
-    qualityNumberRef.current = qualityNumber;
-    setQualityText(qualityNumber == 0 ? 480 : qualityNumber == 1 ? 720 : 1080);
-    await setInitialVideo();
-    preservePauseState();
-    console.log("New Quality Set!");
-    console.log("Quality Switch COUNT: ", qualityOfExprienceRef.current.qualitySwitchCount);
-    console.log("DIRECTION OF UPDATES: ", swtichDirRef.current);
-
-    console.log("Time Spent on 480p: ", qualityOfExprienceRef.current.playbackDuration480);
-    console.log("Time Spent on 720p: ", qualityOfExprienceRef.current.playbackDuration720);
-    console.log("Time Spent on 1080p: ", qualityOfExprienceRef.current.playbackDuration1080);
+    if (qualityNumber < 3) {
+      qualityNumberRef.current = qualityNumber;
+      setQualityText(qualityNumber == 0 ? 480 : qualityNumber == 1 ? 720 : 1080);
+      await setInitialVideo();
+      preservePauseState();
+    } else {
+      console.log("Invalid quality number.");
+    }
   }
 
   function getBufferLeft() {
     const currentTimeNew = videoRef.current.currentTime;
     let bufferInSeconds;
-    let bufferLeft;
 
     for (let i = 0; i < videoRef.current.buffered.length; i++) {
       if (
@@ -218,61 +224,71 @@ function App() {
   }
 
   async function checkBuffer() {
-    if (isBufferingRef.current) return;
-    if (isSeekingRef.current) return;
-    const playerId = playerIdRef.current;
-    const sourceBuffer = sourceBufferRef.current;
-
-    isBufferingRef.current = true;
-    let bufferLeft = null;
-
-    bufferLeft = getBufferLeft();
-
-    console.log(bufferLeft);
-    if (playerId !== playerIdRef.current) return;
-    if (
-      bufferLeft < 30 &&
-      nextSegmentRef.current <= segmentTimelineRef.current.length &&
-      !sourceBuffer.updating
-    ) {
-      if (playerId !== playerIdRef.current) return;
-      console.log("Downloading New Segment...");
-
-      if (!(await fetchAndAppendSegment())) {
+    while (getBufferLeft() < 30) {
+      if (isRetryingDownloadRef.current) return false;
+      if (isBufferingRef.current) return false;
+      if (isSeekingRef.current) return false;
+      const seekId = seekIdRef.current;
+      const playerId = playerIdRef.current;
+      if (seekId !== seekIdRef.current) return false;
+      const nextSegment = nextSegmentRef.current;
+      const sourceBuffer = sourceBufferRef.current;
+      isBufferingRef.current = true;
+      let bufferLeft = getBufferLeft();
+      if (
+        seekId !== seekIdRef.current ||
+        nextSegment > segmentTimelineRef.current.length ||
+        nextSegment !== nextSegmentRef.current ||
+        sourceBuffer.updating ||
+        playerId !== playerIdRef.current
+      ) {
         isBufferingRef.current = false;
-        return;
+        return false;
       }
+      // console.log("Downloading New Segment...");
+      if (!(await fetchAndAppendSegment())) {
+        if (seekId === seekIdRef.current) isBufferingRef.current = false;
+        return false;
+      }
+      if (
+        seekId !== seekIdRef.current ||
+        nextSegment > segmentTimelineRef.current.length ||
+        nextSegment !== nextSegmentRef.current ||
+        playerId !== playerIdRef.current
+      ) {
+        if (seekId === seekIdRef.current) isBufferingRef.current = false;
+        return false;
+      }
+
       nextSegmentRef.current++;
+      if (seekId === seekIdRef.current) isBufferingRef.current = false;
+      if (getBufferLeft() >= 30) return true;
     }
-    isBufferingRef.current = false;
   }
 
   async function findSoughtPosAndAppend() {
+    isBufferingRef.current = false;
     isSeekingRef.current = true;
     seekIdRef.current++;
     const seekId = seekIdRef.current;
-
     const now = videoRef.current.currentTime;
     let startTime = 0;
-
     for (let i = 0; i < segmentTimelineRef.current.length; i++) {
       let duration = segmentTimelineRef.current[i].duration;
-
       const endTime = startTime + duration;
+      //Found the spot
       if (now < endTime && now >= startTime) {
         console.log("Segment NUMBER IS: ", i + 1);
-        if (seekId != seekIdRef.current) return;
-        if (!(await fetchAndAppendSegment(i + 1, seekId))) {
-          isSeekingRef.current = false;
-          return;
-        }
-        nextSegmentRef.current = i + 2;
+        nextSegmentRef.current = i + 1;
         isSeekingRef.current = false;
-        break;
+        if (seekId !== seekIdRef.current) return;
       }
+      if (seekId !== seekIdRef.current) return;
       startTime = endTime;
     }
+    if (seekId !== seekIdRef.current) return;
     isSeekingRef.current = false;
+    checkBuffer();
   }
 
   function decidingDownloadTimeout(segmentSize) {
@@ -286,13 +302,13 @@ function App() {
             1000000),
       );
 
-      console.log("TOA: ", ETA);
+      // console.log("TOA: ", ETA);
 
       const bufferLeft = getBufferLeft();
 
-      console.log("TIMEOUT AMOUNT: ", ETA * 1.3 + bufferLeft * 0.2);
+      // console.log("TIMEOUT AMOUNT: ", ETA * 1.3 + bufferLeft * 0.1);
 
-      return (ETA * 1.3 + bufferLeft * 0.2) * 1000;
+      return (ETA * 1.3 + bufferLeft * 0.1) * 1000;
     }
     return 10000;
   }
@@ -317,7 +333,6 @@ function App() {
       minimum_throughput: null,
       maximum_throughput: 0,
     };
-
     const qualityId = qualityIdRef.current;
     segmentInfo.segmentNumber = segmentNumber;
     segmentInfo.quality = qualityNumberRef.current;
@@ -325,10 +340,11 @@ function App() {
     let paddedSegmentNumber = String(segmentNumber).padStart(5, "0");
     segmentInfo.bufferBeforeRequest = getBufferLeft();
     if (playerId !== playerIdRef.current) return false;
-    const start = performance.now();
     let data = null;
     let qualityNumber = qualityNumberRef.current;
     const seekSignal = abortUponSeekRef.current.signal;
+    let start = null;
+    let end = null;
 
     while (qualityNumber >= 0) {
       const sizeOfSegment =
@@ -345,10 +361,13 @@ function App() {
       }, decidingDownloadTimeout(sizeOfSegment));
       try {
         if (qualityNumber === 0) clearTimeout(abortUponTimeoutTimer);
+        if (seekId !== seekIdRef.current) return false;
+        start = performance.now();
         const response = await fetch(
           `${API_BASE}/segments/seg_${qualityNumber}_${paddedSegmentNumber}.m4s`,
           { signal: AbortSignal.any([abortUponTimeout.signal, seekSignal]) },
         );
+        if (seekId !== seekIdRef.current) return false;
         data = await response.arrayBuffer();
         console.log("Download successful:", {
           segment: paddedSegmentNumber,
@@ -369,27 +388,36 @@ function App() {
             return false;
           qualityOfExprienceRef.current.abortedDownloadCount++;
           if (qualityNumber > 0) qualityNumber--;
+        } else if (error.name === "TypeError") {
+          if (isRetryingDownloadRef.current) return false;
+          isRetryingDownloadRef.current = true;
+          setTimeout(() => {
+            fetchAndAppendSegment();
+            isRetryingDownloadRef.current = false;
+          }, 5000);
+          return false;
         } else {
-          console.error("Download Failed: ", error);
+          console.error("Download Failed: ", error.name);
           return false;
         }
       } finally {
+        end = performance.now();
         if (qualityNumber !== 0) clearTimeout(abortUponTimeoutTimer);
       }
     }
-    if (qualityNumberRef.current !== qualityNumber) {
+    if (qualityNumberRef.current > qualityNumber) {
+      if (seekId !== seekIdRef.current) return false;
       isInternalQualityChangeRef.current = true;
-      await setPlaybackQuality(qualityNumber);
+      await setPlaybackQuality(qualityNumber, "Abort");
     }
 
     segmentInfo.size = data.byteLength;
-    const end = performance.now();
     segmentInfo.downloadTime = end - start;
     segmentInfo.throughput_speed =
       (segmentInfo.size * 8) / 1000000 / (segmentInfo.downloadTime / 1000);
     if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
     if (sourceBufferRef.current.updating) {
-      if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return;
+      if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
       await new Promise((resolve) => {
         sourceBufferRef.current.addEventListener("updateend", resolve, {
           once: true,
@@ -405,7 +433,7 @@ function App() {
 
     segmentInfo.buffer_before_download = getBufferLeft();
     sourceBufferRef.current.appendBuffer(data);
-    console.log("SEGMENT APPEND");
+    // console.log("SEGMENT APPEND");
 
     await new Promise((resolve) => {
       sourceBufferRef.current.addEventListener("updateend", resolve, {
@@ -440,25 +468,29 @@ function App() {
     }
     staticsArrayRef.current.push(statics);
 
-    //Average of Last 5 segments
+    //Average throughput of Last 5 segments
     const segmentInfoLastFive = segmentInfoArray.slice(-5);
-    let segmentInfoLastFiveAverage = 0;
+    let segmentInfoThroughputLastFiveAverage = 0;
     for (let i = 0; i < segmentInfoLastFive.length; i++) {
-      segmentInfoLastFiveAverage += segmentInfoLastFive[i].throughput_speed;
+      segmentInfoThroughputLastFiveAverage += segmentInfoLastFive[i].throughput_speed;
     }
-    segmentInfoLastFiveAverage /= segmentInfoLastFive.length;
-    console.log("Last 5 Average: ", segmentInfoLastFiveAverage);
+    segmentInfoThroughputLastFiveAverage /= segmentInfoLastFive.length;
+    console.log("Average of last 5 throughputs: ", segmentInfoThroughputLastFiveAverage);
 
     // Estimating and setting the quality for the next segment
-    const estimatedThroughput = Math.min(segmentInfo.throughput_speed, segmentInfoLastFiveAverage);
+    const estimatedThroughput = Math.min(
+      segmentInfo.throughput_speed,
+      segmentInfoThroughputLastFiveAverage,
+    );
     let selectedQuality = chooseQuality(estimatedThroughput);
 
     const bufferLeft = getBufferLeft() ?? 0;
 
     if (bufferLeft < 4) selectedQuality = 0;
 
-    console.log("SELECTED QUALITY: ", selectedQuality);
-    if (selectedQuality !== qualityNumberRef.current) await setPlaybackQuality(selectedQuality);
+    // console.log("SELECTED QUALITY: ", selectedQuality);
+    if (selectedQuality !== qualityNumberRef.current)
+      await setPlaybackQuality(selectedQuality, "ABR");
 
     return true;
     //---------------------
@@ -518,19 +550,23 @@ function App() {
           onTimeUpdate={() => {
             checkBuffer();
             if (!videoRef.current.seeking) qualityEndTimeRef.current = videoRef.current.currentTime;
+            if (!isQOEReportDoneRef.current && videoRef.current.currentTime >= 120) {
+              console.log(qualityOfExprienceRef.current);
+              isQOEReportDoneRef.current = true;
+            }
+            console.log(getBufferLeft());
           }}
           onSeeking={() => {
             if (hasPlaybackStartedRef.current) {
-              console.log("SEEKED AND PREVIOUS DOWNLOADS ABORTED");
+              clearTimeout(seekTimeoutRef.current);
+              seekTimeoutRef.current = setTimeout(() => {
+                console.log("SEEKED AND PREVIOUS DOWNLOADS ABORTED");
 
-              abortUponSeekRef.current.abort();
-              abortUponSeekRef.current = new AbortController();
+                abortUponSeekRef.current.abort();
+                abortUponSeekRef.current = new AbortController();
+                findSoughtPosAndAppend();
+              }, 150);
             }
-
-            clearTimeout(seekTimeoutRef.current);
-            seekTimeoutRef.current = setTimeout(() => {
-              findSoughtPosAndAppend();
-            }, 150);
             if (qualityIntervalActiveRef.current) {
               partialQualityTimeRef.current += Math.max(
                 0,
@@ -552,7 +588,7 @@ function App() {
               hasPlaybackStartedRef.current &&
               !isCountingStallRef.current
             ) {
-              qualityOfExprienceRef.current.stallCount++;
+              qualityOfExprienceRef.current.stallCountTotal++;
               stallTimerStartRef.current = performance.now();
               isCountingStallRef.current = true;
             }
@@ -564,7 +600,6 @@ function App() {
               qualityIntervalActiveRef.current = true;
               startupDelayRef.current = startupDelayEndRef.current - startupDelayStartRef.current;
               console.log("Startup Delay: ", startupDelayRef.current);
-
               hasPlaybackStartedRef.current = true;
             }
             if (isCountingStallRef.current) {
@@ -576,18 +611,18 @@ function App() {
 
               console.log("TOTAL DURATION: ", qualityOfExprienceRef.current.stallDurationTotal);
 
-              console.log("TIMES: ", qualityOfExprienceRef.current.stallCount);
+              console.log("TIMES: ", qualityOfExprienceRef.current.stallCountTotal);
             }
           }}
           onEnded={() => {
             if (qualityNumberRef.current === 0)
-              qualityOfExprienceRef.current.playbackDuration480 +=
+              qualityOfExprienceRef.current.playbackDurationTotal480 +=
                 videoRef.current.currentTime - qualityStartTimeRef.current;
             else if (qualityNumberRef.current === 1)
-              qualityOfExprienceRef.current.playbackDuration720 +=
+              qualityOfExprienceRef.current.playbackDurationTotal720 +=
                 videoRef.current.currentTime - qualityStartTimeRef.current;
             else
-              qualityOfExprienceRef.current.playbackDuration1080 +=
+              qualityOfExprienceRef.current.playbackDurationTotal1080 +=
                 videoRef.current.currentTime - qualityStartTimeRef.current;
 
             qualityStartTimeRef.current = videoRef.current.currentTime;
@@ -598,7 +633,7 @@ function App() {
           <button
             onClick={() => {
               if (qualityNumberRef.current != 0) {
-                setPlaybackQuality(0);
+                setPlaybackQuality(0, "Manual");
                 qualityNumberRef.current = 0;
               }
             }}
@@ -608,7 +643,7 @@ function App() {
           <button
             onClick={() => {
               if (qualityNumberRef.current != 1) {
-                setPlaybackQuality(1);
+                setPlaybackQuality(1, "Manual");
                 qualityNumberRef.current = 1;
               }
             }}
@@ -618,7 +653,7 @@ function App() {
           <button
             onClick={() => {
               if (qualityNumberRef.current != 2) {
-                setPlaybackQuality(2);
+                setPlaybackQuality(2, "Manual");
                 qualityNumberRef.current = 2;
               }
             }}

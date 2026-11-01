@@ -70,6 +70,8 @@ function App() {
   useEffect(() => {
     startupDelayStartRef.current = performance.now();
     async function proccessManifestFile() {
+      const started = await experimentModify("start");
+      if (!started) return;
       const manifestFile = await (await fetch(`${API_BASE}/segments/manifest.mpd`)).text();
       const parser = new DOMParser();
       const manifestXml = parser.parseFromString(manifestFile, "application/xml");
@@ -117,7 +119,6 @@ function App() {
     videoRef.current.src = url;
     mediaSource.addEventListener("sourceopen", async () => {
       if (mediaSource !== mediaSourceRef.current) return;
-
       //---------------------------------------------
       const sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.64001e"');
       segmentTimelineRef.current = manifestData.timeLine;
@@ -128,6 +129,34 @@ function App() {
       sourceBuffer.addEventListener("updateend", () => checkBuffer());
     });
   }, [manualQuality, manifestData]);
+
+  async function experimentModify(command) {
+    try {
+      const response = await fetch(`${API_BASE}/experiment/${command}`, {
+        method: "POST",
+      });
+      const result = await response.json();
+      if (command === "start") {
+        const success = response.status === 200 && result.status === "ready";
+        if (!success) {
+          console.error("Experiment failed to start:", result);
+        }
+        return success;
+      }
+      if (command === "stop") {
+        const success = response.status === 202;
+        if (!success) {
+          console.error("Experiment failed to stop:", result);
+        }
+        return success;
+      }
+      console.error("Unknown experiment command:", command);
+      return false;
+    } catch (error) {
+      console.error("Experiment request failed:", error);
+      return false;
+    }
+  }
 
   function preservePauseState() {
     savedTime.current = videoRef.current.currentTime;
@@ -448,15 +477,17 @@ function App() {
     }
 
     if (seekId !== seekIdRef.current) return false;
+    if (playerId !== playerIdRef.current) return false;
+    if (qualityId !== qualityIdRef.current) return false;
     if (qualityNumber !== qualityNumberRef.current) {
       isInternalQualityChangeRef.current = true;
       await setPlaybackQualityAndLog(qualityNumber, "Abort");
     }
     segmentInfo.quality = qualityNumber;
     segmentInfo.size = data.byteLength;
-    segmentInfo.downloadTime = end - start;
+    segmentInfo.downloadTimeMs = end - start;
     segmentInfo.throughput_speed =
-      (segmentInfo.size * 8) / 1000000 / (segmentInfo.downloadTime / 1000);
+      (segmentInfo.size * 8) / 1000000 / (segmentInfo.downloadTimeMs / 1000);
     if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
     if (sourceBufferRef.current.updating) {
       if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
@@ -669,11 +700,22 @@ function App() {
                 }
                 calculateQualityDuration();
                 console.log(structuredClone(qualityOfExprienceRef.current));
-              }, 60000);
+                console.log(structuredClone(segmentInfoArrayRef.current));
+                experimentModify("stop");
+              }, 120000);
             }
           }}
           onEnded={() => {}}
         ></video>
+        <div>
+          <button
+            onClick={() => {
+              experimentModify("stop");
+            }}
+          >
+            STOPING EXPERIMENT
+          </button>
+        </div>
         <div>
           <h1>ABR-Behaving Buttons:</h1>
           <button

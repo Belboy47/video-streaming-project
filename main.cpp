@@ -1,180 +1,305 @@
-#include <filesystem>
-#include <fstream>
+#include "httplib.h"
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstring>
 #include <iostream>
-#include <string>
-//----------------------
-#ifdef _WIN32
-
-#include <WinSock2.h>
-#include <ws2tcpip.h>
-
-using Socket = SOCKET;
-
-void closeSocket(Socket s) { closesocket(s); }
-
-constexpr int SEND_FLAGS = 0;
-#else
-
-#include <arpa/inet.h>
-#include <errno.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include <mutex>
+#include <nlohmann/json.hpp>
+#include <poll.h>
+#include <spawn.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
-using Socket = int;
+std::atomic_bool isExperimentRunning{false};
+std::mutex controlPipeMutex;
+int controlPipeWriteFd = -1;
+bool stopWasSent = false;
 
-void closeSocket(Socket s) { close(s); }
+extern char **environ;
 
-constexpr int INVALID_SOCKET = -1;
-constexpr int SOCKET_ERROR = -1;
+// Wait for one startup byte from Tester: 'R' means the first tc command succeeded.
+// All other results, including EOF or a timeout, mean startup is not confirmed.
+bool waitForTesterReady(int readFd, bool &timedOut) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  timedOut = false;
 
-constexpr int SEND_FLAGS = MSG_NOSIGNAL;
-#endif
-//-------------------
+  while (true) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               deadline - std::chrono::steady_clock::now())
+                               .count();
+    if (remaining <= 0) {
+      timedOut = true;
+      return false;
+    }
 
-//----------------------
+    pollfd fd{readFd, POLLIN, 0};
+    const int result = poll(&fd, 1, static_cast<int>(remaining));
+    if (result == -1 && errno == EINTR) continue;
+    if (result == -1) return false;
+    if (result == 0) {
+      timedOut = true;
+      return false;
+    }
 
-bool sendAll(Socket &clientSocket, std::string &response);
-bool sendAll(Socket &clientSocket, char *buffer, int bytesRead);
-std::string normalHeader(std::string contentType, std::string contentLength);
-std::string getFileSize(std::string filePath);
+    if (fd.revents & (POLLIN | POLLHUP)) {
+      char status = 0;
+      ssize_t count;
+      do {
+        count = read(readFd, &status, 1);
+      } while (count == -1 && errno == EINTR);
+      return count == 1 && status == 'R';
+    }
+    if (fd.revents & (POLLERR | POLLNVAL)) return false;
+  }
+}
 
 int main() {
-//--------------------------------------------SOCKET
-#ifdef _WIN32
-  WSADATA wsaData;
-  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-    std::cout << "WSA Startup Failed";
-    return -1;
+  std::signal(SIGPIPE, SIG_IGN);
+  nlohmann::json response = {{"status", "started"}, {"success", true}};
+
+  httplib::Server server;
+  bool mounted = server.set_mount_point("/segments", "./segments");
+  if (mounted) {
+    server.set_file_extension_and_mimetype_mapping("mpd", "application/dash+xml");
+    server.set_file_extension_and_mimetype_mapping("mp4", "video/mp4");
+    server.set_file_extension_and_mimetype_mapping("m4s", "video/iso.segment");
   }
-#endif
-  Socket serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-  if (serverSocket == INVALID_SOCKET) {
-    std::cout << "Failed to create socket.";
-    return -1;
-  }
-  sockaddr_in ServerAddress{};
-#ifdef _WIN32
-  ServerAddress.sin_addr.S_un.S_addr = INADDR_ANY;
 
-#else
-  ServerAddress.sin_addr.s_addr = INADDR_ANY;
-#endif
-  ServerAddress.sin_port = htons(8080);
-  ServerAddress.sin_family = AF_INET;
-  bind(serverSocket, (const sockaddr *)&ServerAddress, sizeof(ServerAddress));
-  listen(serverSocket, SOMAXCONN);
-  sockaddr_in clientAddress{};
-  socklen_t sizeOfClientAddress = sizeof(clientAddress);
-  while (true) {
-    Socket clientSocket = accept(serverSocket, (sockaddr *)&clientAddress, &sizeOfClientAddress);
-    std::cout << "Request Received\n";
-    //-------------------------------------------------RECEIVING
-    char buffer[1024];
-    std::string receivedMessage;
-    int received = recv(clientSocket, buffer, sizeof(buffer), 0);
-    if (received > 0) {
-      receivedMessage.append(buffer, received);
-      size_t firstSpace = receivedMessage.find(' ');
-      size_t secondSpace = receivedMessage.find(' ', firstSpace + 1);
-      size_t lineEnd = receivedMessage.find("\r\n");
-      std::string method = receivedMessage.substr(0, firstSpace);
-      std::string path = receivedMessage.substr(firstSpace + 1, (secondSpace - firstSpace) - 1);
-      std::string version = receivedMessage.substr(secondSpace + 1, (lineEnd - secondSpace) - 1);
-      std::cout << receivedMessage << "\n";
+  server.set_post_routing_handler([](const httplib::Request &req, httplib::Response &res) {
+    res.set_header("Access-Control-Allow-Origin", "http://172.19.188.84:5173");
+  });
+  //========================================POST
+  server.Options("/experiment/start", [](const httplib::Request &req, httplib::Response &res) {
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.status = 200;
+  });
+  server.Post("/experiment/start", [&](const httplib::Request &req, httplib::Response &res) {
+    if (isExperimentRunning.exchange(true)) {
+      res.status = 409;
+      res.set_content(R"({"error": "An Experiment is already running"})", "application/json");
+      return;
+    }
 
-      size_t firstSlashPos;
-      size_t secondSlashPos;
-      size_t thirdSlashPos;
-      std::string resourceType;
-      std::string fileName;
+    int controlPipe[2];
 
-      firstSlashPos = path.find('/');
-      secondSlashPos = path.find('/', firstSlashPos + 1);
-      resourceType = path.substr(firstSlashPos + 1, secondSlashPos - firstSlashPos - 1);
-      fileName = path.substr(secondSlashPos + 1);
+    if (pipe(controlPipe) == -1) {
+      int error = errno;
+      isExperimentRunning.store(false);
 
-      std::cout << resourceType << '\n';
-      std::cout << fileName << '\n';
-      std::string filePath = path.substr(1);
+      res.status = 500;
+      res.set_content(nlohmann::json{{"error", std::strerror(error)}}.dump(), "application/json");
+      return;
+    }
+    int readyPipe[2];
+    if (pipe(readyPipe) == -1) {
+      int error = errno;
+      close(controlPipe[0]);
+      close(controlPipe[1]);
+      isExperimentRunning.store(false);
 
-      if (resourceType.empty() || fileName.empty() || resourceType != "segments") {
-        closeSocket(clientSocket);
-        continue;
-      }
-      std::string fileType;
-      if (fileName.ends_with(".mpd"))
-        fileType = "application/dash+xml";
-      else if (fileName.ends_with(".mp4"))
-        fileType = "video/mp4";
-      else if (fileName.ends_with(".m4s"))
-        fileType = "video/iso.segment";
+      res.status = 500;
+      res.set_content(nlohmann::json{{"error", std::strerror(error)}}.dump(), "application/json");
+      return;
+    }
 
-      std::ifstream file(filePath, std::ios::binary);
-      if (!file) {
-        std::cout << "File DOES NOT EXIST";
-        closeSocket(clientSocket);
-        continue;
-      }
-      std::string header = normalHeader(fileType, getFileSize(filePath));
-      sendAll(clientSocket, header);
+    posix_spawn_file_actions_t actions;
 
-      char buffer[4096];
-      while (file) {
-        file.read(buffer, sizeof(buffer));
+    int actionError = posix_spawn_file_actions_init(&actions);
 
-        auto bytesRead = file.gcount();
+    if (actionError != 0) {
+      close(controlPipe[0]);
+      close(controlPipe[1]);
+      close(readyPipe[0]);
+      close(readyPipe[1]);
+      isExperimentRunning.store(false);
 
-        if (bytesRead > 0) {
-          sendAll(clientSocket, buffer, static_cast<int>(bytesRead));
+      res.status = 500;
+      res.set_content(nlohmann::json{{"error", std::strerror(actionError)}}.dump(),
+                      "application/json");
+      return;
+    }
+
+    actionError = posix_spawn_file_actions_adddup2(&actions, controlPipe[0], STDIN_FILENO);
+
+    if (actionError == 0) {
+      actionError = posix_spawn_file_actions_addclose(&actions, controlPipe[0]);
+    }
+
+    if (actionError == 0) {
+      actionError = posix_spawn_file_actions_addclose(&actions, controlPipe[1]);
+    }
+
+    if (actionError == 0) {
+      actionError = posix_spawn_file_actions_adddup2(&actions, readyPipe[1], STDOUT_FILENO);
+    }
+
+    if (actionError == 0) {
+      actionError = posix_spawn_file_actions_addclose(&actions, readyPipe[0]);
+    }
+
+    if (actionError == 0) {
+      actionError = posix_spawn_file_actions_addclose(&actions, readyPipe[1]);
+    }
+
+    if (actionError != 0) {
+      posix_spawn_file_actions_destroy(&actions);
+      close(controlPipe[0]);
+      close(controlPipe[1]);
+      close(readyPipe[0]);
+      close(readyPipe[1]);
+      isExperimentRunning.store(false);
+
+      res.status = 500;
+      res.set_content(nlohmann::json{{"error", std::strerror(actionError)}}.dump(),
+                      "application/json");
+      return;
+    }
+
+    pid_t childPid;
+
+    char arg0[] = "sudo";
+    char arg1[] = "-n";
+    char arg2[] = "/usr/local/bin/main-project-tester";
+    char *args[] = {arg0, arg1, arg2, nullptr};
+
+    int error = posix_spawn(&childPid, "/usr/bin/sudo", &actions, nullptr, args, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(controlPipe[0]);
+    close(readyPipe[1]);
+
+    if (error != 0) {
+      close(controlPipe[1]);
+      close(readyPipe[0]);
+      isExperimentRunning.store(false);
+
+      res.status = 500;
+      res.set_content(nlohmann::json{{"error", std::strerror(error)}}.dump(), "application/json");
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(controlPipeMutex);
+
+      controlPipeWriteFd = controlPipe[1];
+      stopWasSent = false;
+    }
+
+    std::thread([childPid]() {
+      int status;
+      pid_t result;
+
+      do {
+        result = waitpid(childPid, &status, 0);
+      } while (result == -1 && errno == EINTR);
+
+      if (result == -1) {
+        std::cerr << "waitpid failed: " << std::strerror(errno) << '\n';
+
+      } else {
+        if (WIFEXITED(status)) {
+          std::cerr << "Tester exited with code " << WEXITSTATUS(status) << '\n';
+
+        } else if (WIFSIGNALED(status)) {
+          std::cerr << "Tester terminated by signal " << WTERMSIG(status) << '\n';
         }
+        {
+          std::lock_guard<std::mutex> lock(controlPipeMutex);
+
+          if (controlPipeWriteFd != -1) {
+            close(controlPipeWriteFd);
+            controlPipeWriteFd = -1;
+          }
+
+          stopWasSent = false;
+        }
+
+        isExperimentRunning.store(false);
       }
+    }).detach();
+
+    bool timedOut = false;
+    const bool ready = waitForTesterReady(readyPipe[0], timedOut);
+    close(readyPipe[0]);
+
+    if (!ready) {
+      // Closing the command pipe tells Tester to cancel as soon as it polls stdin.
+      {
+        std::lock_guard<std::mutex> lock(controlPipeMutex);
+        if (controlPipeWriteFd != -1) {
+          close(controlPipeWriteFd);
+          controlPipeWriteFd = -1;
+        }
+        stopWasSent = false;
+      }
+
+      res.status = timedOut ? 504 : 500;
+      res.set_content(R"({"error":"Tester did not confirm network readiness"})", "application/json");
+      return;
     }
-    closeSocket(clientSocket);
-  }
-}
 
-bool sendAll(Socket &clientSocket, std::string &response) {
-  int totalSent{};
-  while (totalSent < response.size()) {
-    int sent = send(clientSocket, response.c_str() + totalSent, response.size() - totalSent, SEND_FLAGS);
-    if (sent == SOCKET_ERROR) {
-      return false;
+    nlohmann::json response = {{"status", "ready"}, {"success", true}};
+
+    res.status = 200;
+    res.set_content(response.dump(), "application/json");
+  });
+
+  server.Options("/experiment/stop", [](const httplib::Request &req, httplib::Response &res) {
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.status = 204;
+  });
+
+  server.Post("/experiment/stop", [](const httplib::Request &req, httplib::Response &res) {
+    std::lock_guard<std::mutex> lock(controlPipeMutex);
+
+    if (!isExperimentRunning.load()) {
+      res.status = 409;
+      res.set_content(R"({"error":"No experiment is running"})", "application/json");
+      return;
     }
-    totalSent += sent;
-  }
-  return true;
-}
 
-bool sendAll(Socket &clientSocket, char *buffer, int bytesRead) {
-  int totalSent{};
-  while (totalSent < bytesRead) {
-    int temp = send(clientSocket, buffer + totalSent, bytesRead - totalSent, SEND_FLAGS);
-    if (temp == SOCKET_ERROR)
-      return false;
+    if (controlPipeWriteFd == -1) {
+      res.status = 409;
+      res.set_content(R"({"error":"Experiment is not ready to receive commands"})",
+                      "application/json");
+      return;
+    }
 
-    totalSent += temp;
-  }
+    if (stopWasSent) {
+      res.status = 202;
+      res.set_content(R"({"status":"stop_already_requested"})", "application/json");
+      return;
+    }
 
-  return true;
-}
+    const char stopCommand[] = "c\n";
 
-std::string normalHeader(std::string contentType, std::string contentLength) {
+    ssize_t bytesWritten = write(controlPipeWriteFd, stopCommand, sizeof(stopCommand) - 1);
 
-  return "HTTP/1.1 200 OK \r\n"
-         "Content-Length: " +
-         contentLength +
-         "\r\n"
-         "Content-Type: " +
-         contentType +
-         "\r\n"
-         "Access-Control-Allow-Origin: *\r\n"
-         "Connection: close\r\n"
-         "\r\n";
-}
+    if (bytesWritten == -1) {
+      int error = errno;
 
-std::string getFileSize(std::string filePath) {
-  auto fileSize = std::filesystem::file_size(filePath);
-  std::string fileSizeSTR = std::to_string(fileSize);
-  return fileSizeSTR;
+      res.status = 500;
+      res.set_content(nlohmann::json{{"error", std::strerror(error)}}.dump(), "application/json");
+      return;
+    }
+
+    if (bytesWritten != 2) {
+      res.status = 500;
+      res.set_content(R"({"error":"Incomplete stop command write"})", "application/json");
+      return;
+    }
+
+    stopWasSent = true;
+
+    res.status = 202;
+    res.set_content(R"({"status":"stop_requested"})", "application/json");
+  });
+
+  server.listen("0.0.0.0", 8080);
 }

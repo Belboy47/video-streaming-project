@@ -14,7 +14,8 @@ function App() {
   const savedTime = useRef(0);
   const wasPaused = useRef(true);
   const videoRef = useRef(null);
-  const sourceBufferRef = useRef(null);
+  const videoSourceBufferRef = useRef(null);
+  const audioSourceBufferRef = useRef(null);
   const nextSegmentRef = useRef(1);
   const segmentTimelineRef = useRef([]);
   const isSeekingRef = useRef(false);
@@ -104,7 +105,7 @@ function App() {
       setManifestData({ durationTotal, timeLine });
 
       const allReps = MPDElement.querySelectorAll("Representation");
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 4; i++) {
         manifestBandwidthArrRef.current[i] = Number(allReps[i].getAttribute("bandwidth"));
       }
     }
@@ -120,13 +121,16 @@ function App() {
     mediaSource.addEventListener("sourceopen", async () => {
       if (mediaSource !== mediaSourceRef.current) return;
       //---------------------------------------------
-      const sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.64001e"');
+      const videoSourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.64001e"');
+      const audioSourceBuffer = mediaSource.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
       segmentTimelineRef.current = manifestData.timeLine;
       mediaSource.duration = manifestData.durationTotal;
-      sourceBufferRef.current = sourceBuffer;
-      await setInitialVideo(mediaSource);
+      videoSourceBufferRef.current = videoSourceBuffer;
+      audioSourceBufferRef.current = audioSourceBuffer;
+      await setInitAudio();
+      await setInitVideo(mediaSource);
       seekAndAppendSegment();
-      sourceBuffer.addEventListener("updateend", () => checkBuffer());
+      videoSourceBuffer.addEventListener("updateend", () => checkBuffer());
     });
   }, [manualQuality, manifestData]);
 
@@ -158,6 +162,11 @@ function App() {
     }
   }
 
+  async function setInitAudio() {
+    const response = await (await fetch(`${API_BASE}/segments/init_3.mp4`)).arrayBuffer();
+    audioSourceBufferRef.current.appendBuffer(response);
+  }
+
   function preservePauseState() {
     savedTime.current = videoRef.current.currentTime;
     wasPaused.current = videoRef.current.paused;
@@ -171,13 +180,13 @@ function App() {
     isBufferingRef.current = false;
   }
 
-  async function setInitialVideo(
+  async function setInitVideo(
     mediaSource = mediaSourceRef.current,
     qualityNumber = qualityNumberRef.current,
   ) {
     const playerId = playerIdRef.current;
     const qualityId = qualityIdRef.current;
-    const sourceBuffer = sourceBufferRef.current;
+    const videoSourceBuffer = videoSourceBufferRef.current;
     if (InitFilesArrRef.current[qualityNumber] === null) {
       const response = await (
         await fetch(`${API_BASE}/segments/init_${qualityNumber}.mp4`)
@@ -186,9 +195,9 @@ function App() {
     }
     if (mediaSourceRef.current.readyState !== "open" || playerId !== playerIdRef.current) return;
 
-    if (sourceBuffer.updating) {
+    if (videoSourceBuffer.updating) {
       await new Promise((resolve) => {
-        sourceBuffer.addEventListener("updateend", resolve, {
+        videoSourceBuffer.addEventListener("updateend", resolve, {
           once: true,
         });
       });
@@ -200,7 +209,7 @@ function App() {
     )
       return;
     if (mediaSource === mediaSourceRef.current) {
-      sourceBuffer.appendBuffer(InitFilesArrRef.current[qualityNumber]);
+      videoSourceBuffer.appendBuffer(InitFilesArrRef.current[qualityNumber]);
     }
   }
   async function setPlaybackQualityAndLog(qualityNumber, reason = "no reason given") {
@@ -217,7 +226,7 @@ function App() {
     qualityOfExprienceRef.current.qualitySwitchCount++;
     qualityNumberRef.current = qualityNumber;
 
-    await setInitialVideo(undefined, qualityNumber);
+    await setInitVideo(undefined, qualityNumber);
     preservePauseState();
   }
 
@@ -335,22 +344,19 @@ function App() {
       const playerId = playerIdRef.current;
       if (seekId !== seekIdRef.current) return false;
       const nextSegment = nextSegmentRef.current;
-      const sourceBuffer = sourceBufferRef.current;
+      const videoSourceBuffer = videoSourceBufferRef.current;
       isBufferingRef.current = true;
       if (
         seekId !== seekIdRef.current ||
         nextSegment > segmentTimelineRef.current.length ||
         nextSegment !== nextSegmentRef.current ||
-        sourceBuffer.updating ||
+        videoSourceBuffer.updating ||
         playerId !== playerIdRef.current
       ) {
         isBufferingRef.current = false;
         return false;
       }
-      const sizeOfSegment =
-        (manifestData.timeLine[nextSegmentRef.current - 1].duration *
-          manifestBandwidthArrRef.current[qualityNumber]) /
-        8;
+
       let result = await fetchAndAppendSegment(undefined, undefined, qualityNumber);
       if (result === "AbortError") {
         if (
@@ -422,15 +428,16 @@ function App() {
     let paddedSegmentNumber = String(segmentNumber).padStart(5, "0");
     segmentInfo.bufferBeforeRequest = getBufferLeft();
     if (playerId !== playerIdRef.current) return false;
-    let data = null;
+    let dataVideo = null;
     const seekSignal = abortUponSeekRef.current.signal;
     let start = null;
     let end = null;
     segmentInfo.buffer_before_download = getBufferLeft();
 
+    const durationOfSegment = manifestData.timeLine[segmentNumber - 1].duration;
     const sizeOfSegment =
-      (manifestData.timeLine[segmentNumber - 1].duration *
-        manifestBandwidthArrRef.current[qualityNumber]) /
+      (durationOfSegment *
+        (manifestBandwidthArrRef.current[qualityNumber] + manifestBandwidthArrRef.current[3])) /
       8;
     console.log("Downloading:", {
       segment: paddedSegmentNumber,
@@ -451,7 +458,7 @@ function App() {
         { signal: AbortSignal.any([abortUponTimeout.signal, seekSignal]) },
       );
       if (seekId !== seekIdRef.current) return false;
-      data = await response.arrayBuffer();
+      dataVideo = await response.arrayBuffer();
       console.log("Download successful:", {
         segment: paddedSegmentNumber,
         quality: qualityNumber,
@@ -472,9 +479,18 @@ function App() {
         return "DownloadFailed";
       }
     } finally {
-      end = performance.now();
+      //MOVE AFTER AUDIO DOWNLOAD WITH A CATCH
       clearTimeout(abortUponTimeoutTimer);
     }
+    if (seekId !== seekIdRef.current) return false;
+    if (playerId !== playerIdRef.current) return false;
+    const response = await fetch(`${API_BASE}/segments/seg_3_${paddedSegmentNumber}.m4s`);
+    if (!response.ok) return "DownloadFailed";
+    if (seekId !== seekIdRef.current) return false;
+    if (playerId !== playerIdRef.current) return false;
+    const dataAudio = await response.arrayBuffer();
+
+    end = performance.now();
 
     if (seekId !== seekIdRef.current) return false;
     if (playerId !== playerIdRef.current) return false;
@@ -484,15 +500,15 @@ function App() {
       await setPlaybackQualityAndLog(qualityNumber, "Abort");
     }
     segmentInfo.quality = qualityNumber;
-    segmentInfo.size = data.byteLength;
+    segmentInfo.size = dataVideo.byteLength + dataAudio.byteLength;
     segmentInfo.downloadTimeMs = end - start;
     segmentInfo.throughput_speed =
       (segmentInfo.size * 8) / 1000000 / (segmentInfo.downloadTimeMs / 1000);
     if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
-    if (sourceBufferRef.current.updating) {
+    if (videoSourceBufferRef.current.updating) {
       if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
       await new Promise((resolve) => {
-        sourceBufferRef.current.addEventListener("updateend", resolve, {
+        videoSourceBufferRef.current.addEventListener("updateend", resolve, {
           once: true,
         });
       });
@@ -504,14 +520,30 @@ function App() {
     )
       return false;
 
-    sourceBufferRef.current.appendBuffer(data);
-    // console.log("SEGMENT APPEND");
+    videoSourceBufferRef.current.appendBuffer(dataVideo);
 
     await new Promise((resolve) => {
-      sourceBufferRef.current.addEventListener("updateend", resolve, {
+      videoSourceBufferRef.current.addEventListener("updateend", resolve, {
         once: true,
       });
     });
+
+    if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
+    if (audioSourceBufferRef.current.updating) {
+      await new Promise((resolve) => {
+        audioSourceBufferRef.current.addEventListener("updateend", resolve, {
+          once: true,
+        });
+      });
+    }
+    if (seekId != seekIdRef.current || playerId !== playerIdRef.current) return false;
+    audioSourceBufferRef.current.appendBuffer(dataAudio);
+    await new Promise((resolve) => {
+      audioSourceBufferRef.current.addEventListener("updateend", resolve, {
+        once: true,
+      });
+    });
+
     segmentInfo.buffer_after_download = getBufferLeft();
     //----
     segmentInfoArrayRef.current.push(segmentInfo);

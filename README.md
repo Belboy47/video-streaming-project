@@ -1,224 +1,136 @@
-# Adaptive Bitrate Video Streaming (ABR)
+# Adaptive Bitrate Streaming — Experimental Research Platform
 
-A browser-based adaptive video streaming project with a custom C++ HTTP server, a React video player, and a C++ network-condition tester built around Linux traffic control (`tc netem`).
+An independent project exploring adaptive video streaming, network contention, and playback performance under controlled network conditions.
 
-The goal is to investigate how throughput, available playback buffer, and changing network conditions affect video quality and playback continuity. The project emphasizes **quality of experience (QoE)**: maintaining useful video quality while limiting stalls, unnecessary quality changes, and abandoned downloads.
+**Status:** Experimental prototype with preliminary results; ongoing validation.
 
-**Status:** Functional streaming and network-testing prototypes. ABR parameter tuning and controlled performance evaluation are in progress.
+## Overview
 
-## How it works
+I originally started this project to develop a video player from the ground up and understand the mechanisms behind adaptive bitrate (ABR) streaming. As the project progressed, my focus shifted from implementing a player toward investigating its behavior under changing network conditions and competition from other applications.
 
-```text
-Windows browser
-    |
-    v
-React player (Media Source Extensions)
-    |
-    | HTTP: manifest, initialization segments, media segments
-    v
-C++ HTTP server
-    |
-    v
-Segmented video files
+The current platform combines a custom MPEG-DASH player, network emulation, competing traffic workloads, automated experiments, and performance telemetry. Its purpose is to explore research questions and develop experimental skills rather than to present a production-ready player or a novel ABR algorithm.
 
-C++ network tester --> Linux tc/netem --> shaped server traffic
+## Research questions
+
+- How does throughput estimation influence bitrate selection and playback stability?
+- How does a streaming client behave when it shares a network bottleneck with another streaming client and bursty web traffic?
+- What trade-offs arise between adaptation responsiveness, video quality, quality switching, and buffering?
+- What explains differences in playback performance between repeated experiments with the same configured network conditions?
+
+## System architecture
+
+```mermaid
+flowchart TD
+    A[Custom React / MSE player] <-->|Media segments and experiment API| B[C++ HTTP server]
+    B -->|Experiment lifecycle| C[C++ tester]
+    C --> D[Linux tc / netem / IFB]
+    C --> E[Docker browser simulation / Web Page Replay]
+    F[dash.js competing player] <-->|Media segments| B
+    A --> G[Playback and ABR telemetry]
+    D --> H[Network telemetry]
+    E --> I[Workload lifecycle and diagnostic logs]
+    G --> J[Per-run experiment results]
+    H --> J
+    I --> J
 ```
 
-The player reads an MPEG-DASH MPD manifest, fetches fragmented MP4 segments, and appends them using the browser's Media Source Extensions (MSE) API. The C++ server serves the video assets over HTTP. Separately, the network tester applies timed Linux traffic-control settings so the player can be evaluated under changing conditions.
+Video segment traffic and replayed web traffic are directed into a shared emulated bottleneck using Linux traffic control.
 
-## Implemented features
+| Component                                      | Purpose                                                                         |
+| ---------------------------------------------- | ------------------------------------------------------------------------------- |
+| React and Media Source Extensions (MSE)        | Custom DASH playback, segment fetching, buffering, and bitrate adaptation       |
+| C++ HTTP server                                | Media delivery, experiment configuration, orchestration, and result persistence |
+| C++ tester                                     | Network emulation, browser workload coordination, and network telemetry         |
+| dash.js                                        | Competing adaptive video streaming workload                                     |
+| Docker, Browsertime, and Web Page Replay (WPR) | Replaying recorded browsing workloads under controlled conditions               |
+| Linux `tc`, `netem`, and IFB                   | Shared bandwidth limitation, network delay, and traffic measurement             |
 
-### React player
+## ABR strategy and experiment controls
 
-- Three video representations: **480p, 720p, and 1080p**.
-- MPD manifest parsing, including segment timing information.
-- Fragmented MP4 playback through **MediaSource** and **SourceBuffer**.
-- Automatic bitrate selection based on observed segment-download throughput.
-- Buffer-aware fallback to the lowest quality when very little playback buffer remains.
-- A dynamic download timeout based on estimated download time and available buffer.
-- Cancellation and retry at a lower quality when a timed download attempt expires.
-- Quality-switching controls, including buffer-preserving and player-reloading behaviors.
-- Seeking support with cancellation of obsolete requests.
-- In-memory measurements of throughput, buffering, quality changes, and playback QoE.
+The custom player uses measured segment download throughput, recent throughput history, and a configurable safety factor to guide quality selection. Buffer occupancy and estimated download time also influence its download and retry behavior.
 
-### C++ HTTP server
+The experimental framework supports configurable throughput averaging windows, quality safety factors, buffer targets, download timeout parameters, workload selection, browser scheduling, and repeated runs. A configuration snapshot is saved with the experiment results to record the settings used.
 
-- A custom C++ server used to deliver the video manifest, initialization segments, and media segments.
-- Runs locally on Linux/WSL2 for development and can be compiled for a Linux server.
+## Preliminary experimental results
 
-### C++ network tester
+A preliminary workload-comparison experiment was conducted using a shared **16 Mbps** bottleneck, **100 ms of configured network delay** (not a measured round-trip time), and a **120-second playback observation window**. The video has three available resolutions: 480p, 720p, and 1080p.
 
-- Uses Linux **`tc netem`** to apply scheduled network conditions.
-- Supports predefined conditions such as high bandwidth, sudden deterioration, recovery, and increased latency.
-- Uses **`std::chrono::steady_clock`** and scheduled deadlines to limit cumulative timing drift.
-- Runs separately from the streaming server and player.
+The following results represent five runs per configured workload combination. The custom ABR player is enabled in every configuration. The reported quality duration refers to playback by the custom player, not the competing dash.js client.
 
-## Current ABR strategy
+| Competing workloads    | Mean 1080p playback (s) | 1080p min–max (s) | Mean quality switches | Total stalls across 5 runs |
+| ---------------------- | ----------------------: | -----------------------: | --------------------: | -------------------------: |
+| None (baseline)        |                  111.95 |            111.94–111.96 |                   2.0 |                          0 |
+| One browser            |                  111.94 |            111.92–111.96 |                   2.0 |                          0 |
+| Two browsers           |                  111.94 |            111.93–111.94 |                   2.0 |                          0 |
+| dash.js                |                   77.52 |              75.92–83.81 |                   3.4 |                          1 |
+| dash.js + one browser  |                   67.93 |              59.93–75.94 |                   5.8 |                          0 |
+| dash.js + two browsers |                   39.95 |               0.00–67.93 |                   5.2 |                          0 |
 
-After a completed segment download, the player estimates available throughput conservatively using the lower of:
+**Configuration caveat:** The baseline used a seven-segment throughput averaging window; the other five reported configurations used five. Workload was therefore not the only varying setting across the full table. See the [per-run data and configuration index](research/experiments/README.md) for the recorded metrics and supplementary runs.
 
-1. The throughput measured for the latest completed segment.
-2. The average throughput of up to the five latest completed segments.
+### Observations
 
-A safety factor is applied before selecting the next video representation. The current implementation also forces the lowest quality when less than four seconds of video remain buffered.
+- The custom player maintained nearly identical 1080p playback durations in the baseline and browser-only configurations.
+- Competition from dash.js was associated with reduced 1080p playback duration. The reduction was greater when browser workloads were enabled alongside dash.js.
+- The combined workloads produced considerable run-to-run variability, particularly with two browsers. This motivated the addition of more detailed network and player telemetry.
+- In a subsequent instrumented run, traffic-control counters showed both video and replayed web traffic entering the shared bottleneck, along with periods of queue accumulation.
 
-For download timeouts, the player estimates segment arrival time from segment size and measured throughput. Its current experimental timeout rule is:
+These are exploratory observations, not statistically established conclusions. Five runs per configuration are insufficient to characterize the full variability of the system or isolate every causal factor. The workload configurations indicate which processes were enabled; they do not independently establish that every browser journey or competing playback completed as intended.
 
-```text
-Timeout (seconds) = 1.3 × estimated download time + 0.2 × buffer remaining
-```
+## Measurement and telemetry
 
-The estimated download time uses a conservative comparison of the latest throughput and the cumulative average throughput. The initial download uses a 10-second fallback timeout; the lowest-quality download is not subject to the same timeout-based downgrade logic.
+The framework records playback performance indicators related to Quality of Experience (QoE):
 
-**These rules are experimental.** Their coefficients and thresholds have not yet been established as optimal by controlled tests.
+- Playback duration at each resolution
+- Startup delay, stall count, and total stall duration
+- Quality switch count and history
+- Aborted segment downloads
 
-## QoE and diagnostic measurements
+The newer instrumentation additionally records segment download timings and sizes, throughput estimates, buffer occupancy, adaptation events, network traffic counters, IFB queue backlog, and workload lifecycle events.
 
-The player currently tracks or derives:
+These measurements are intended to help explain why a particular playback outcome occurred rather than relying exclusively on aggregate performance scores. Resolution duration and stalling are useful performance indicators, but they do not by themselves constitute a validated subjective QoE model.
 
-| Measurement | Purpose |
-| --- | --- |
-| Playback duration at each quality | Compare time spent at 480p, 720p, and 1080p |
-| Stall count | Count playback interruptions |
-| Total stall duration | Measure interruption severity |
-| Quality-switch count and direction | Detect frequent changes and oscillations |
-| Timeout-triggered download aborts | Evaluate download retry behavior |
-| Segment throughput and download duration | Estimate network performance |
-| Buffer before and after segment downloads | Understand buffering behavior |
-| Startup delay | Observe time to initial playback |
+## Development history and use of AI
 
-Measurements currently live in the application and browser console; a repeatable export/reporting pipeline is planned.
+### Phase 1 — Personally implemented player (September–November 2026)
 
-## Requirements
+I wrote the original project's implementation myself, including the C++ HTTP backend, custom MPEG-DASH playback, buffering, seeking, bitrate adaptation, audio support, and initial experimental tools. I used AI for learning, explanations, and technical discussion, not to generate the implementation code committed during this phase. Third-party libraries and framework scaffolding are separate from my own implementation.
 
-- A C++17-capable compiler such as **G++**.
-- **Node.js** and **npm** for the React/Vite frontend.
-- A modern browser with Media Source Extensions support.
-- Video assets and an MPD manifest matching the paths expected by the server and player.
-- **Linux** or **WSL2 Ubuntu** for `tc netem` testing.
-- `iproute2` for `tc`; `iperf3` and `tcpdump` are useful optional diagnostics.
-- Administrative privileges (`sudo`) to change Linux queueing disciplines.
+The [November 2 development snapshot](https://github.com/Belboy47/video-streaming-project/tree/39e72e60c9c942c0b9b02f486b65c04064f0d4cc) is the last published snapshot of this phase. The earlier commit history documents the incremental development of the player.
 
-On Ubuntu, useful packages can be installed with:
+### Phase 2 — AI-assisted experimental research platform (current milestone)
 
-```bash
-sudo apt update
-sudo apt install build-essential iproute2 iperf3 tcpdump
-```
+Beginning with this milestone, I delegated substantial implementation work to AI tools as my focus shifted toward network behavior, experiment design, and the interpretation of results. Significant portions of the updated player, C++ experimental infrastructure, workload orchestration, instrumentation, and supporting documentation were generated or revised with AI assistance.
 
-Node.js can be installed independently using a Node version manager such as `nvm`.
+I directed the investigation, selected the experimental questions and configurations, and interpreted the preliminary findings with AI as a technical collaborator. The current implementation should not be mistaken for entirely independently handwritten code. It remains an experimental prototype requiring further review and validation.
 
-## Running locally
+## Repository guide
 
-The examples below assume `main.cpp` is in the repository root. **Replace the frontend and tester paths with their actual locations in your checkout.**
+| Path                   | Description                                                   |
+| ---------------------- | ------------------------------------------------------------- |
+| `main.cpp`             | C++ HTTP backend and experiment orchestration                 |
+| `frontend/src/App.jsx` | Custom ABR player and playback instrumentation                |
+| `tester/tester.cpp`    | Linux network emulation, workload coordination, and telemetry |
 
-### 1. Build and run the C++ server
+Additional published files include `tester/experiment-parameters.js` (workload and ABR controls), `frontend/src/CompetingPlayer.jsx` (dash.js workload), `frontend/src/QoEResult.jsx` (results display), `digikala-journey.mjs` (browser replay journey), and `third_party/` (cpp-httplib and nlohmann/json headers and license notices). The DASH media assets and recorded WPR archive are not included.
 
-From the repository root:
+Experiments generate configuration snapshots, per-run JSON results, average results, and, in the newer instrumented version, telemetry JSON and tester logs.
 
-```bash
-g++ -std=c++17 -O2 -pthread main.cpp -o abr-server
-./abr-server
-```
+### Experimental environment
 
-The frontend expects the development HTTP server on **port 8080**. Make sure your segment files are present in the location the server expects. For access from Windows through WSL's network IP, the server must listen on a reachable interface, rather than only `127.0.0.1`.
+The platform has been developed and tested in a WSL2/Linux environment. Running the full experiment requires a compatible browser and Node.js/React environment, a C++17 compiler, cpp-httplib and nlohmann/json headers, Linux traffic-control/IFB support, Docker, the media assets, and the browsing replay archive and scripts. Network emulation requires appropriate Linux privileges.
 
-### 2. Start the React frontend
+The frontend manifest and lockfile are the supplied project files, but do not declare dash.js; see [frontend setup notes](frontend/README.md). The current browser journey handles its own seed and timing; the controller configuration alone does not guarantee identical browser timing or randomization. The vendored C++ headers match the supplied copies of cpp-httplib 0.63.0 and nlohmann/json 3.12.0.
 
-In the directory containing the frontend's `package.json`:
+This repository is an experimental development snapshot. A complete, independently verified setup and reproduction procedure is not yet documented here; the source files alone may not be sufficient to reproduce the full experiment.
 
-```bash
-npm install
-npm run dev -- --host 0.0.0.0
-```
+## Limitations and future work
 
-Vite normally uses port **5173**. In WSL2, obtain the current Linux IP address with:
+- Validate browser replay reliability and individual workload health, including observed replay request failures and browser initialization warnings.
+- Perform additional repeated experiments and analyze uncertainty and the causes of run-to-run variation.
+- Improve per-client traffic attribution and distinguish traffic offered to the bottleneck from traffic actually delivered. Current port-based network counters aggregate video clients and aggregate replayed browser traffic.
+- Improve cross-process timing alignment and evaluate the effects of throughput estimation and buffer-management parameters.
+- Account for a historical 480p/720p playback-counter labeling error in older results before comparing lower-resolution durations across versions. The 1080p duration counter was unaffected by that specific error.
+- Develop a more complete evaluation methodology, including appropriate ABR baselines and QoE models.
 
-```bash
-hostname -I
-```
-
-Open `http://<WSL-IP>:5173` in your Windows browser.
-
-During development, the frontend targets `http://<browser-hostname>:8080`. For production builds, it uses relative `/segments/...` requests, which require appropriate same-origin hosting or reverse-proxy configuration.
-
-### 3. Confirm that traffic shaping reaches the video connection
-
-Do not assume that a WSL2 localhost connection passes through `eth0`. Inspect the browser's actual segment-request URL and, if necessary, capture traffic:
-
-```bash
-sudo tcpdump -ni eth0 'tcp port 8080'
-```
-
-Before benchmarking, confirm that media traffic crosses the interface you intend to shape. WSL networking modes and forwarding behavior can affect this.
-
-## Manual network shaping
-
-The following example applies a **4 Mbps outgoing rate limit** and **80 ms of additional one-way delay** to `eth0`:
-
-```bash
-sudo tc qdisc replace dev eth0 root netem rate 4mbit delay 80ms
-```
-
-Inspect the configuration and counters:
-
-```bash
-sudo tc -s qdisc show dev eth0
-```
-
-Remove the test configuration when finished:
-
-```bash
-sudo tc qdisc del dev eth0 root
-```
-
-**Caution:** A root queueing discipline affects outgoing traffic on the selected interface, not only the video server. The settings remain active after the controlling program exits unless explicitly removed or the interface is reset. Use an isolated development environment and restore networking after interrupted tests.
-
-## Automated network testing
-
-The C++ tester is intended to play a predefined sequence of network profiles, with changes occurring at scheduled times. A representative first scenario is:
-
-| Phase | Bandwidth | Added delay | Duration |
-| --- | ---: | ---: | ---: |
-| Excellent | 15 Mbps | 25 ms | 20 s |
-| Sudden deterioration | 2.5 Mbps | 25 ms | 40 s |
-| Recovery | 12 Mbps | 25 ms | 25 s |
-| Latency spike | 12 Mbps | 300 ms | 15 s |
-| Moderate network | 4 Mbps | 50 ms | 35 s |
-
-These are **illustrative test profiles**, not standardized definitions of network quality. The initial tests keep jitter and packet loss at zero to better isolate bandwidth and latency effects.
-
-To compile the tester, substitute its real source-file path:
-
-```bash
-g++ -std=c++17 -O2 -pthread <tester-source.cpp> -o network-tester
-sudo ./network-tester
-```
-
-Always check and clear remaining traffic shaping after the experiment. Automated cleanup on interruption is an important improvement for the tester.
-
-## Experimental methodology
-
-The primary comparison is between ABR/timeout strategies under **the same network scenario**. Useful outcomes include:
-
-- More playback time at higher video quality, without unacceptable interruptions.
-- Fewer and shorter stalls.
-- Fewer unnecessary quality oscillations.
-- Fewer needless download aborts and less wasted transfer data.
-- Faster appropriate adaptation after a bandwidth drop or recovery.
-
-For meaningful comparisons, keep the video, segment representations, test sequence, initial playback state, and cache conditions consistent. Repeat each run and compare the results rather than interpreting a single trial as conclusive.
-
-## Known limitations and next steps
-
-- **Throughput measurement:** When a segment requires retries, the current measurement can include time spent on previous attempts, which can bias the effective throughput estimate.
-- **Partial transfer waste:** Aborted download counts are tracked, but discarded bytes are not yet measured.
-- **Reporting:** QoE measurements are not yet automatically exported to structured experiment files.
-- **Test repeatability:** Planned improvements include synchronized playback/test starts, timestamps for actual condition changes, and repeated runs.
-- **Test realism:** Future scenarios may include controlled jitter, packet loss, burst failures, and recorded network traces.
-- **Platform validation:** WSL2 is useful for development, but key results should also be checked on a Linux VPS or dedicated Linux test environment.
-- **Algorithm tuning:** Current quality thresholds and timeout coefficients require experimental evaluation.
-
-## Project purpose
-
-This is a hands-on exploration of adaptive video delivery, C++ networking, browser media APIs, Linux traffic control, and the relationship between network performance and perceived playback quality. The next major milestone is a **repeatable QoE benchmark** that provides evidence for comparing ABR strategies rather than selecting thresholds solely by intuition.
+The next objective is to consolidate the experimental findings and identify a more focused research direction before extending the implementation further.

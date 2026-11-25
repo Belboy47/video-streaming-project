@@ -1,0 +1,10 @@
+batch_id,custom_abr,dashjs,browser_count_enabled,throughput_averaging_segments,configured_traffic_seed,available_runs,reported_five_run_batch
+007,true,false,0,7,isolated_baseline,5,true
+008,true,true,0,5,abr_dashjs,5,true
+009,true,false,1,5,baseline,5,true
+010,true,false,1,5,baseline,3,false
+011,true,false,2,5,baseline,5,true
+012,true,true,2,5,baseline,5,true
+013,true,true,1,5,baseline,5,true
+014,true,true,1,5,baseline,1,false
+015,true,true,2,5,baseline,1,false

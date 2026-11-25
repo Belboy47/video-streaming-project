@@ -1,16 +1,7 @@
-# React + Vite
+# Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The React/Vite frontend contains the custom MPEG-DASH player (App.jsx), the competing dash.js component, and the experiment results display.
 
-Currently, two official plugins are available:
+From this directory, install the dependencies listed in the supplied lockfile with `npm ci`. The competing player also imports `dashjs`, which is absent from the supplied manifest and lockfile; install the appropriate dash.js version locally (e.g. `npm install --no-save --package-lock=false dashjs`). The exact version used in the original experiments was not captured in these files. The frontend development command is `npm run dev`.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+The player requires the C++ backend, compatible DASH media assets and a prepared Linux/WSL experiment environment. See the [root README](../README.md) for the architecture and limitations. A clean build and end-to-end reproduction have not been independently verified for this repository snapshot.
